@@ -21,9 +21,11 @@ Ever wished you could make your stubborn programs use a proxy without them even 
 - Compatible with cgroup v1 and v2
 - No background daemon required
 - Easy integration with existing software like V2Ray, Xray, and Shadowsocks
+- Direct dial-out to a remote HTTP / SOCKS5 proxy via the built-in TCP bridge (`--upstream`)
+- Optional `nftables` backend (auto-detected, falls back to `iptables`)
 
 > [!TIP]
-> Your proxy should be a transparent proxy port (like V2Ray's `dokodemo-door` inbound or shadowsocks `ss-redir`). But don't panic if you only have a SOCKS5 or HTTP proxy! There are tools that can transform it [faster than Bill Clinton](https://youtu.be/Dv0PxINy2ds?t=570) (check out [transocks](https://github.com/cybozu-go/transocks), [ipt2socks](https://github.com/zfl9/ipt2socks) and [ip2socks-go](https://github.com/lcdbin/ip2socks-go)).
+> By default cproxy assumes `--port` points at a transparent proxy you started yourself (like V2Ray's `dokodemo-door` inbound or shadowsocks `ss-redir`). If you only have a regular HTTP CONNECT or SOCKS5 proxy (e.g. one running on your Windows host while cproxy runs in WSL), pass it via `--upstream` and cproxy will run a small TCP bridge for you. See the [WSL section](#wsl--windows-proxy) below.
 
 ## Installation
 
@@ -113,6 +115,47 @@ sudo cproxy --port 1080 --cgroup-path /sys/fs/cgroup/mygroup --mode tproxy
 ```
 
 This command will proxy all TCP and UDP traffic from processes within the `/sys/fs/cgroup/mygroup` cgroup using TPROXY mode on port `1080`.
+
+### WSL + Windows Proxy
+
+When the proxy you actually want to use is a regular HTTP CONNECT or SOCKS5 listener on your Windows host (Clash, V2RayN, mihomo, sing-box, etc.), cproxy can dial it directly without you starting a separate transparent-proxy helper. Pass `--upstream` and cproxy will start an internal TCP bridge on `--port`, accept the redirected connections, recover the original destination via `SO_ORIGINAL_DST`, and re-open it through the upstream proxy.
+
+```bash
+# Replace 192.168.1.10 with the Windows host IP that the proxy binds to.
+sudo cproxy \
+  --port 1090 \
+  --upstream socks5://192.168.1.10:1080 \
+  -- curl https://www.google.com
+
+# HTTP CONNECT works the same way.
+sudo cproxy --port 1090 --upstream http://192.168.1.10:7890 -- ./your-program
+```
+
+Notes:
+
+* Only TCP is supported through `--upstream` for now (no UDP, no DNS-over-UDP rewrite). `--upstream` and `--redirect-dns` cannot be combined for the same reason and cproxy will refuse the combination.
+* Only `--mode redirect` is supported together with `--upstream`.
+* The bridge tags its own outbound sockets with `SO_MARK = 0xC9B3` and the firewall rules return early on that mark, so the bridge's connection to the upstream proxy is **not** routed back into itself.
+* `SO_MARK` requires `CAP_NET_ADMIN`. cproxy keeps the parent process at effective root for the lifetime of the bridge in `--upstream` mode and probes the capability at startup, so it fails fast with a clear error if you try to run it under a less privileged user. The child program you launch still drops to your invoking user.
+* Authentication is not supported in this build; URLs with `user:pass@` are rejected.
+* WSL does not auto-detect your Windows host IP; specify it explicitly. If you switch networks regularly you can read the gateway with `ip route show default | awk '/default/ {print $3}'` and inject it via `CPROXY_UPSTREAM`.
+
+### Firewall Backend Selection
+
+Cproxy supports two firewall backends:
+
+* `iptables` (default fallback) – works with both cgroup v1 and v2.
+* `nftables` – auto-preferred when `nft` is available **and** the host is running cgroup v2.
+
+Override with `--firewall {auto,nft,iptables}`:
+
+```bash
+sudo cproxy --firewall nft --upstream socks5://10.0.0.1:1080 -- curl https://example.com
+```
+
+`--firewall nft` requires cgroup v2 and a kernel/nftables combination that supports `socket cgroupv2 level N`. On older systems use `--firewall iptables` (or rely on `auto`, which detects this and falls back automatically).
+
+If `auto` or `--firewall iptables` selects the iptables backend, the `iptables` userspace command must be installed on `PATH`; otherwise cproxy now fails fast with a backend selection error instead of a later rule-creation failure.
 
 ## The Secret Sauce
 

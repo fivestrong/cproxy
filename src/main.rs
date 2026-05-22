@@ -1,8 +1,13 @@
 #![allow(dyn_drop)]
 
+use crate::bridge::BridgeGuard;
+use crate::config::{ChildCommand, Cli, Mode, BRIDGE_MARK};
+use crate::firewall::{select_backend, FirewallBackend};
 use crate::guards::TraceGuard;
-use eyre::Result;
+use crate::upstream::UpstreamConfig;
+use eyre::{eyre, Result};
 use guards::{CGroupGuard, RedirectGuard, TProxyGuard};
+use std::convert::TryFrom;
 use std::os::unix::prelude::CommandExt;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,42 +15,85 @@ use std::sync::Arc;
 use std::time::Duration;
 use structopt::StructOpt;
 
+mod bridge;
+mod config;
+mod firewall;
 mod guards;
+mod upstream;
 
-#[derive(StructOpt, Debug)]
-struct Cli {
-    /// Redirect traffic to specific local port.
-    #[structopt(long, env = "CPROXY_PORT", default_value = "1080")]
-    port: u32,
-
-    /// redirect DNS traffic. This option only works with redirect mode
-    #[structopt(long)]
-    redirect_dns: bool,
-
-    /// Proxy mode can be `trace` (use iptables TRACE target to debug program network), `tproxy`, or `redirect`.
-    #[structopt(long, default_value = "redirect")]
-    mode: String,
-
-    /// Override dns server address. This option only works with tproxy mode
-    #[structopt(long)]
-    override_dns: Option<String>,
-
-    /// Proxy an existing process.
-    #[structopt(long)]
-    pid: Option<u32>,
-
-    /// Proxy specific cgroup paths, can be specified multiple times)
-    #[structopt(long)]
-    cgroup_path: Vec<String>,
-
-    #[structopt(subcommand)]
-    command: Option<ChildCommand>,
+/// Build the firewall guard for the chosen mode. When an upstream is supplied
+/// `--mode redirect` also enables a SO_MARK exemption so the bridge's outbound
+/// connection bypasses the redirect rule.
+fn build_guard(
+    backend: Arc<dyn FirewallBackend>,
+    mode: Mode,
+    args: &Cli,
+    cgroup_guard: CGroupGuard,
+    id_for_chain: u32,
+    bridge_mark_exempt: Option<u32>,
+) -> Result<Box<dyn Drop>> {
+    let port = args.port;
+    match mode {
+        Mode::Redirect => {
+            let output_chain_name = format!("cp_rd_out_{}", id_for_chain);
+            Ok(Box::new(RedirectGuard::new(
+                backend,
+                port,
+                output_chain_name.as_str(),
+                cgroup_guard,
+                args.redirect_dns,
+                bridge_mark_exempt,
+            )?))
+        }
+        Mode::Tproxy => {
+            let output_chain_name = format!("cp_tp_out_{}", id_for_chain);
+            let prerouting_chain_name = format!("cp_tp_pre_{}", id_for_chain);
+            let mark = id_for_chain;
+            Ok(Box::new(TProxyGuard::new(
+                backend,
+                port,
+                mark,
+                output_chain_name.as_str(),
+                prerouting_chain_name.as_str(),
+                cgroup_guard,
+                args.override_dns.clone(),
+            )?))
+        }
+        Mode::Trace => {
+            let prerouting_chain_name = format!("cp_tr_pre_{}", id_for_chain);
+            let output_chain_name = format!("cp_tr_out_{}", id_for_chain);
+            Ok(Box::new(TraceGuard::new(
+                backend,
+                output_chain_name.as_str(),
+                prerouting_chain_name.as_str(),
+                cgroup_guard,
+            )?))
+        }
+    }
 }
 
-#[derive(StructOpt, Debug)]
-enum ChildCommand {
-    #[structopt(external_subcommand)]
-    Command(Vec<String>),
+/// Spin up the optional internal bridge (`--upstream`). Returns `None` when no
+/// upstream was requested. The bridge listens on `--port` so existing redirect
+/// rules don't need to know whether they target an external transparent proxy
+/// or the internal bridge.
+fn maybe_start_bridge(args: &Cli) -> Result<Option<BridgeGuard>> {
+    let url = match &args.upstream {
+        Some(u) => u,
+        None => return Ok(None),
+    };
+    let upstream = UpstreamConfig::parse(url)?;
+    let port = u16::try_from(args.port)
+        .map_err(|_| eyre!("--port {} is out of range for u16", args.port))?;
+    let guard = BridgeGuard::spawn(port, upstream, BRIDGE_MARK)?;
+    Ok(Some(guard))
+}
+
+fn redirect_bridge_mark(args: &Cli) -> Option<u32> {
+    if args.upstream.is_some() {
+        Some(BRIDGE_MARK)
+    } else {
+        None
+    }
 }
 
 fn proxy_new_command(args: &Cli) -> Result<ExitStatus> {
@@ -57,44 +105,23 @@ fn proxy_new_command(args: &Cli) -> Result<ExitStatus> {
     tracing::info!("subcommand {:?}", child_command);
 
     let port = args.port;
+    let mode = args.mode_enum()?;
+
+    // Bridge first so the firewall rules below land on a port that's already
+    // listening; otherwise the very first redirected connection could race
+    // with bind(2).
+    let _bridge_guard = maybe_start_bridge(args)?;
 
     let cgroup_guard = CGroupGuard::new(pid)?;
-    let _guard: Box<dyn Drop> = match args.mode.as_str() {
-        "redirect" => {
-            let output_chain_name = format!("cp_rd_out_{}", pid);
-            Box::new(RedirectGuard::new(
-                port,
-                output_chain_name.as_str(),
-                cgroup_guard,
-                args.redirect_dns,
-            )?)
-        }
-        "tproxy" => {
-            let output_chain_name = format!("cp_tp_out_{}", pid);
-            let prerouting_chain_name = format!("cp_tp_pre_{}", pid);
-            let mark = pid;
-            Box::new(TProxyGuard::new(
-                port,
-                mark,
-                output_chain_name.as_str(),
-                prerouting_chain_name.as_str(),
-                cgroup_guard,
-                args.override_dns.clone(),
-            )?)
-        }
-        "trace" => {
-            let prerouting_chain_name = format!("cp_tr_pre_{}", pid);
-            let output_chain_name = format!("cp_tr_out_{}", pid);
-            Box::new(TraceGuard::new(
-                output_chain_name.as_str(),
-                prerouting_chain_name.as_str(),
-                cgroup_guard,
-            )?)
-        }
-        &_ => {
-            unimplemented!()
-        }
-    };
+    let backend = select_backend(args.firewall_choice()?, cgroup_guard.hier_v2)?;
+    let _guard = build_guard(
+        backend,
+        mode,
+        args,
+        cgroup_guard,
+        pid,
+        redirect_bridge_mark(args),
+    )?;
 
     let sudo_uid = std::env::var("SUDO_UID").ok();
     let sudo_gid = std::env::var("SUDO_GID").ok();
@@ -114,8 +141,24 @@ fn proxy_new_command(args: &Cli) -> Result<ExitStatus> {
         command.env("HOME", sudo_home);
     }
     let mut child = command.args(&child_command[1..]).spawn()?;
-    nix::unistd::seteuid(original_uid)?;
-    nix::unistd::setegid(original_gid)?;
+    // The child program was already configured to run as the invoking user
+    // via `command.uid()/gid()`, so historically we also dropped the parent
+    // process' euid here as defense-in-depth. With `--upstream` that is
+    // actively wrong: the in-process bridge runs under the parent and calls
+    // `setsockopt(SO_MARK)` for every upstream connection, which requires
+    // CAP_NET_ADMIN. glibc's NPTL synchronises `seteuid` across all threads,
+    // so dropping the parent here would also strip the bridge worker
+    // threads of the capability and every redirected connection would fail
+    // with EPERM at the first SO_MARK call. Keep the parent privileged in
+    // upstream mode; the child still ran as the invoking user.
+    if args.upstream.is_none() {
+        nix::unistd::seteuid(original_uid)?;
+        nix::unistd::setegid(original_gid)?;
+    } else {
+        tracing::debug!(
+            "keeping parent euid=root for the duration of the bridge (--upstream is set)"
+        );
+    }
 
     ctrlc::set_handler(move || {
         println!("received ctrl-c, terminating...");
@@ -126,45 +169,20 @@ fn proxy_new_command(args: &Cli) -> Result<ExitStatus> {
 }
 
 fn proxy_existing_pid(pid: u32, args: &Cli) -> Result<()> {
-    let port = args.port;
+    let mode = args.mode_enum()?;
+
+    let _bridge_guard = maybe_start_bridge(args)?;
 
     let cgroup_guard = CGroupGuard::new(pid)?;
-    let _guard: Box<dyn Drop> = match args.mode.as_str() {
-        "redirect" => {
-            let output_chain_name = format!("cp_rd_out_{}", pid);
-            Box::new(RedirectGuard::new(
-                port,
-                output_chain_name.as_str(),
-                cgroup_guard,
-                args.redirect_dns,
-            )?)
-        }
-        "tproxy" => {
-            let output_chain_name = format!("cp_tp_out_{}", pid);
-            let prerouting_chain_name = format!("cp_tp_pre_{}", pid);
-            let mark = pid;
-            Box::new(TProxyGuard::new(
-                port,
-                mark,
-                output_chain_name.as_str(),
-                prerouting_chain_name.as_str(),
-                cgroup_guard,
-                args.override_dns.clone(),
-            )?)
-        }
-        "trace" => {
-            let prerouting_chain_name = format!("cp_tr_pre_{}", pid);
-            let output_chain_name = format!("cp_tr_out_{}", pid);
-            Box::new(TraceGuard::new(
-                output_chain_name.as_str(),
-                prerouting_chain_name.as_str(),
-                cgroup_guard,
-            )?)
-        }
-        _ => {
-            unimplemented!()
-        }
-    };
+    let backend = select_backend(args.firewall_choice()?, cgroup_guard.hier_v2)?;
+    let _guard = build_guard(
+        backend,
+        mode,
+        args,
+        cgroup_guard,
+        pid,
+        redirect_bridge_mark(args),
+    )?;
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -182,48 +200,31 @@ fn proxy_existing_pid(pid: u32, args: &Cli) -> Result<()> {
 }
 
 fn proxy_cgroup_paths(paths: Vec<String>, args: &Cli) -> Result<()> {
-    let port = args.port;
+    let mode = args.mode_enum()?;
+
+    let _bridge_guard = maybe_start_bridge(args)?;
 
     let mut guards: Vec<Box<dyn Drop>> = Vec::new();
+    let mut shared_backend: Option<Arc<dyn FirewallBackend>> = None;
 
     for path in paths {
         let cgroup_guard = CGroupGuard::from_path(&path)?;
-        let guard: Box<dyn Drop> = match args.mode.as_str() {
-            "redirect" => {
-                let output_chain_name = format!("cp_rd_out_{}", cgroup_guard.class_id);
-                Box::new(RedirectGuard::new(
-                    port,
-                    output_chain_name.as_str(),
-                    cgroup_guard,
-                    args.redirect_dns,
-                )?)
-            }
-            "tproxy" => {
-                let output_chain_name = format!("cp_tp_out_{}", cgroup_guard.class_id);
-                let prerouting_chain_name = format!("cp_tp_pre_{}", cgroup_guard.class_id);
-                let mark = cgroup_guard.class_id;
-                Box::new(TProxyGuard::new(
-                    port,
-                    mark,
-                    output_chain_name.as_str(),
-                    prerouting_chain_name.as_str(),
-                    cgroup_guard,
-                    args.override_dns.clone(),
-                )?)
-            }
-            "trace" => {
-                let prerouting_chain_name = format!("cp_tr_pre_{}", cgroup_guard.class_id);
-                let output_chain_name = format!("cp_tr_out_{}", cgroup_guard.class_id);
-                Box::new(TraceGuard::new(
-                    output_chain_name.as_str(),
-                    prerouting_chain_name.as_str(),
-                    cgroup_guard,
-                )?)
-            }
-            _ => {
-                unimplemented!()
-            }
+        let backend = if let Some(b) = &shared_backend {
+            b.clone()
+        } else {
+            let b = select_backend(args.firewall_choice()?, cgroup_guard.hier_v2)?;
+            shared_backend = Some(b.clone());
+            b
         };
+        let id_for_chain = cgroup_guard.class_id;
+        let guard = build_guard(
+            backend,
+            mode,
+            args,
+            cgroup_guard,
+            id_for_chain,
+            redirect_bridge_mark(args),
+        )?;
         guards.push(guard);
     }
 
@@ -252,6 +253,7 @@ fn main() -> Result<()> {
     nix::unistd::setegid(nix::unistd::Gid::from_raw(0))
         .expect("cproxy failed to seteuid, please run as root");
     let args: Cli = Cli::from_args();
+    args.validate()?;
 
     if args.cgroup_path.len() > 0 {
         proxy_cgroup_paths(args.cgroup_path.clone(), &args)?;

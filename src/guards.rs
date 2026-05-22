@@ -1,6 +1,8 @@
+use crate::firewall::{CgroupMatch, FirewallBackend, RedirectParams, TProxyParams, TraceParams};
 use cgroups_rs::cgroup_builder::CgroupBuilder;
 use cgroups_rs::{Cgroup, CgroupPid};
 use eyre::Result;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[allow(unused)]
@@ -37,7 +39,6 @@ impl CGroupGuard {
     pub fn from_path(path: &str) -> Result<Self> {
         let hier = cgroups_rs::hierarchies::auto();
         let hier_v2 = hier.v2();
-        // Use path hash as class_id to avoid conflicts
         let class_id = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -58,6 +59,18 @@ impl CGroupGuard {
             cg_path: path.to_string(),
             class_id,
         })
+    }
+
+    /// Build a `CgroupMatch` suitable for handing to a firewall backend.
+    pub fn to_match(&self) -> CgroupMatch {
+        CgroupMatch {
+            class_id: self.class_id,
+            v2_path: if self.hier_v2 {
+                Some(self.cg_path.clone())
+            } else {
+                None
+            },
+        }
     }
 }
 
@@ -81,72 +94,47 @@ impl Drop for CGroupGuard {
 
 #[allow(unused)]
 pub struct RedirectGuard {
-    port: u32,
-    output_chain_name: String,
+    backend: Arc<dyn FirewallBackend>,
+    params: RedirectParams,
     cgroup_guard: CGroupGuard,
-    redirect_dns: bool,
 }
 
 impl RedirectGuard {
     pub fn new(
+        backend: Arc<dyn FirewallBackend>,
         port: u32,
         output_chain_name: &str,
         cgroup_guard: CGroupGuard,
         redirect_dns: bool,
+        bridge_mark_exempt: Option<u32>,
     ) -> Result<Self> {
         tracing::debug!(
-            "creating redirect guard on port {}, with redirect_dns: {}",
+            "creating redirect guard on port {}, with redirect_dns: {}, backend: {}",
             port,
-            redirect_dns
-        );
-        let class_id = cgroup_guard.class_id;
-        let cgroup_path = cgroup_guard.cg_path.as_str();
-        (cmd_lib::run_cmd! {
-        iptables -t nat -N ${output_chain_name};
-        iptables -t nat -A OUTPUT -j ${output_chain_name};
-        iptables -t nat -A ${output_chain_name} -p udp -o lo -j RETURN;
-        iptables -t nat -A ${output_chain_name} -p tcp -o lo -j RETURN;
-        })?;
-
-        if cgroup_guard.hier_v2 {
-            (cmd_lib::run_cmd! {
-                iptables -t nat -A ${output_chain_name} -p tcp -m cgroup --path ${cgroup_path} -j REDIRECT --to-ports ${port};
-            })?;
-            if redirect_dns {
-                (cmd_lib::run_cmd! {
-                    iptables -t nat -A ${output_chain_name} -p udp -m cgroup --path ${cgroup_path} --dport 53 -j REDIRECT --to-ports ${port};
-                })?;
-            }
-        } else {
-            (cmd_lib::run_cmd! {
-                iptables -t nat -A ${output_chain_name} -p tcp -m cgroup --cgroup ${class_id} -j REDIRECT --to-ports ${port};
-            })?;
-            if redirect_dns {
-                (cmd_lib::run_cmd! {
-                    iptables -t nat -A ${output_chain_name} -p udp -m cgroup --cgroup ${class_id} --dport 53 -j REDIRECT --to-ports ${port};
-                })?;
-            }
-        }
-
-        Ok(Self {
-            port,
-            output_chain_name: output_chain_name.to_owned(),
-            cgroup_guard,
             redirect_dns,
+            backend.name()
+        );
+        let params = RedirectParams {
+            chain_name: output_chain_name.to_owned(),
+            listen_port: port,
+            cgroup: cgroup_guard.to_match(),
+            redirect_dns,
+            bridge_mark_exempt,
+        };
+        backend.setup_redirect(&params)?;
+        Ok(Self {
+            backend,
+            params,
+            cgroup_guard,
         })
     }
 }
 
 impl Drop for RedirectGuard {
     fn drop(&mut self) {
-        let output_chain_name = &self.output_chain_name;
-
-        (cmd_lib::run_cmd! {
-          iptables -t nat -D OUTPUT -j ${output_chain_name};
-          iptables -t nat -F ${output_chain_name};
-          iptables -t nat -X ${output_chain_name};
-        })
-        .expect("drop iptables and cgroup failed");
+        if let Err(e) = self.backend.teardown_redirect(&self.params) {
+            tracing::error!("failed to tear down redirect rules: {}", e);
+        }
     }
 }
 
@@ -212,17 +200,15 @@ impl IpRuleGuard {
 
 #[allow(unused)]
 pub struct TProxyGuard {
-    port: u32,
-    mark: u32,
-    output_chain_name: String,
-    prerouting_chain_name: String,
+    backend: Arc<dyn FirewallBackend>,
+    params: TProxyParams,
     iprule_guard: IpRuleGuard,
     cgroup_guard: CGroupGuard,
-    override_dns: Option<String>,
 }
 
 impl TProxyGuard {
     pub fn new(
+        backend: Arc<dyn FirewallBackend>,
         port: u32,
         mark: u32,
         output_chain_name: &str,
@@ -230,129 +216,63 @@ impl TProxyGuard {
         cgroup_guard: CGroupGuard,
         override_dns: Option<String>,
     ) -> Result<Self> {
-        let class_id = cgroup_guard.class_id;
-        let cg_path = cgroup_guard.cg_path.as_str();
         tracing::debug!(
-            "creating tproxy guard on port {}, with override_dns: {:?}",
+            "creating tproxy guard on port {}, with override_dns: {:?}, backend: {}",
             port,
-            override_dns
+            override_dns,
+            backend.name()
         );
         let iprule_guard = IpRuleGuard::new(mark, mark);
-        (cmd_lib::run_cmd! {
-
-        iptables -t mangle -N ${prerouting_chain_name};
-        iptables -t mangle -A PREROUTING -j ${prerouting_chain_name};
-        iptables -t mangle -A ${prerouting_chain_name} -p tcp -o lo -j RETURN;
-        iptables -t mangle -A ${prerouting_chain_name} -p udp -o lo -j RETURN;
-        iptables -t mangle -A ${prerouting_chain_name} -p udp -m mark --mark ${mark} -j TPROXY --on-ip 127.0.0.1 --on-port ${port};
-        iptables -t mangle -A ${prerouting_chain_name} -p tcp -m mark --mark ${mark} -j TPROXY --on-ip 127.0.0.1 --on-port ${port};
-
-        iptables -t mangle -N ${output_chain_name};
-        iptables -t mangle -A OUTPUT -j ${output_chain_name};
-        iptables -t mangle -A ${output_chain_name} -p tcp -o lo -j RETURN;
-        iptables -t mangle -A ${output_chain_name} -p udp -o lo -j RETURN;
-        })?;
-
-        if override_dns.is_some() {
-            (cmd_lib::run_cmd! {
-                iptables -t nat -N ${output_chain_name};
-                iptables -t nat -A OUTPUT -j ${output_chain_name};
-                iptables -t nat -A ${output_chain_name} -p udp -o lo -j RETURN;
-            })?;
-        }
-
-        if cgroup_guard.hier_v2 {
-            (cmd_lib::run_cmd! {
-                iptables -t mangle -A ${output_chain_name} -p tcp -m cgroup --path ${cg_path} -j MARK --set-mark ${mark};
-                iptables -t mangle -A ${output_chain_name} -p udp -m cgroup --path ${cg_path} -j MARK --set-mark ${mark};
-            })?;
-            if let Some(override_dns) = &override_dns {
-                (cmd_lib::run_cmd! {
-                    iptables -t nat -A ${output_chain_name} -p udp -m cgroup --path ${cg_path} --dport 53 -j DNAT --to-destination ${override_dns};
-                })?;
-            }
-        } else {
-            (cmd_lib::run_cmd! {
-                iptables -t mangle -A ${output_chain_name} -p tcp -m cgroup --cgroup ${class_id} -j MARK --set-mark ${mark};
-                iptables -t mangle -A ${output_chain_name} -p udp -m cgroup --cgroup ${class_id} -j MARK --set-mark ${mark};
-            })?;
-            if let Some(override_dns) = &override_dns {
-                (cmd_lib::run_cmd! {
-                    iptables -t nat -A ${output_chain_name} -p udp -m cgroup --cgroup ${class_id} --dport 53 -j DNAT --to-destination ${override_dns};
-                })?;
-            }
-        }
-
-        Ok(Self {
-            port,
-            mark,
+        let params = TProxyParams {
             output_chain_name: output_chain_name.to_owned(),
             prerouting_chain_name: prerouting_chain_name.to_owned(),
+            listen_port: port,
+            mark,
+            cgroup: cgroup_guard.to_match(),
+            override_dns,
+        };
+        backend.setup_tproxy(&params)?;
+        Ok(Self {
+            backend,
+            params,
             iprule_guard,
             cgroup_guard,
-            override_dns,
         })
     }
 }
 
 impl Drop for TProxyGuard {
     fn drop(&mut self) {
-        let output_chain_name = &self.output_chain_name;
-        let prerouting_chain_name = &self.prerouting_chain_name;
-
         std::thread::sleep(Duration::from_millis(100));
-
-        (cmd_lib::run_cmd! {
-            iptables -t mangle -D PREROUTING -j ${prerouting_chain_name};
-            iptables -t mangle -F ${prerouting_chain_name};
-            iptables -t mangle -X ${prerouting_chain_name};
-
-            iptables -t mangle -D OUTPUT -j ${output_chain_name};
-            iptables -t mangle -F ${output_chain_name};
-            iptables -t mangle -X ${output_chain_name};
-        })
-        .expect("drop iptables and cgroup failed");
-
-        if self.override_dns.is_some() {
-            (cmd_lib::run_cmd! {
-            iptables -t nat -D OUTPUT -j ${output_chain_name};
-            iptables -t nat -F ${output_chain_name};
-            iptables -t nat -X ${output_chain_name};
-            })
-            .expect("drop iptables failed");
+        if let Err(e) = self.backend.teardown_tproxy(&self.params) {
+            tracing::error!("failed to tear down tproxy rules: {}", e);
         }
     }
 }
 
 #[allow(unused)]
 pub struct TraceGuard {
-    prerouting_chain_name: String,
-    output_chain_name: String,
+    backend: Arc<dyn FirewallBackend>,
+    params: TraceParams,
     cgroup_guard: CGroupGuard,
 }
 
 impl TraceGuard {
     pub fn new(
+        backend: Arc<dyn FirewallBackend>,
         output_chain_name: &str,
         prerouting_chain_name: &str,
         cgroup_guard: CGroupGuard,
     ) -> Result<Self> {
-        let class_id = cgroup_guard.class_id;
-        (cmd_lib::run_cmd! {
-        // iptables -t raw -N ${prerouting_chain_name};
-        // iptables -t raw -A PREROUTING -j ${prerouting_chain_name};
-        // iptables -t raw -A ${prerouting_chain_name} -p udp -j LOG;
-        // iptables -t raw -A ${prerouting_chain_name} -p tcp -j LOG;
-
-        iptables -t raw -N ${output_chain_name};
-        iptables -t raw -A OUTPUT -j ${output_chain_name};
-        iptables -t raw -A ${output_chain_name} -m cgroup --cgroup ${class_id} -p tcp -j LOG;
-        iptables -t raw -A ${output_chain_name} -m cgroup --cgroup ${class_id} -p udp -j LOG;
-        })?;
-
-        Ok(Self {
+        let params = TraceParams {
             output_chain_name: output_chain_name.to_owned(),
             prerouting_chain_name: prerouting_chain_name.to_owned(),
+            cgroup: cgroup_guard.to_match(),
+        };
+        backend.setup_trace(&params)?;
+        Ok(Self {
+            backend,
+            params,
             cgroup_guard,
         })
     }
@@ -360,20 +280,9 @@ impl TraceGuard {
 
 impl Drop for TraceGuard {
     fn drop(&mut self) {
-        let output_chain_name = &self.output_chain_name;
-        let _prerouting_chain_name = &self.prerouting_chain_name;
-
         std::thread::sleep(Duration::from_millis(100));
-
-        (cmd_lib::run_cmd! {
-            // iptables -t raw -D PREROUTING -j ${prerouting_chain_name};
-            // iptables -t raw -F ${prerouting_chain_name};
-            // iptables -t raw -X ${prerouting_chain_name};
-
-            iptables -t raw -D OUTPUT -j ${output_chain_name};
-            iptables -t raw -F ${output_chain_name};
-            iptables -t raw -X ${output_chain_name};
-        })
-        .expect("drop iptables and cgroup failed");
+        if let Err(e) = self.backend.teardown_trace(&self.params) {
+            tracing::error!("failed to tear down trace rules: {}", e);
+        }
     }
 }

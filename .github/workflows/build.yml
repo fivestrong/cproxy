@@ -48,7 +48,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y iptables iproute2 socat curl dnsutils cgroup-tools
+          sudo apt-get install -y iptables nftables iproute2 socat curl dnsutils cgroup-tools
 
       - name: Build cproxy
         run: |
@@ -63,3 +63,11 @@ jobs:
       - name: Run Redirect Mode Tests
         run: |
           sudo ./test/run_all_tests.sh
+
+      - name: Run Upstream (HTTP/SOCKS5) Tests
+        run: |
+          sudo ./test/run_upstream_tests.sh
+
+      - name: Run nft Backend Tests
+        run: |
+          sudo ./test/run_nft_backend_tests.sh
