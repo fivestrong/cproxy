@@ -32,11 +32,10 @@ fi
 
 # Probe whether the kernel/nftables combination on this host actually
 # understands `socket cgroupv2`. We do this by trying to create a throwaway
-# table; if the parser rejects it, fall back gracefully.
-PROBE_OUT=$(sudo nft -c -- "add table ip cproxy_probe; add chain ip cproxy_probe c { type filter hook output priority 0; }; add rule ip cproxy_probe c socket cgroupv2 level 1 \"x\" return" 2>&1 || true)
-if echo "$PROBE_OUT" | grep -qi "syntax error\|unknown\|invalid"; then
-    echo "nft on this host does not support 'socket cgroupv2': $PROBE_OUT"
-    echo "skipping."
+# table; if the command fails, fall back gracefully.
+if ! sudo nft -c -- "add table ip cproxy_probe; add chain ip cproxy_probe c { type filter hook output priority 0; }; add rule ip cproxy_probe c socket cgroupv2 level 1 \"x\" return" >/dev/null 2>&1; then
+    echo "nft on this host does not support 'socket cgroupv2' or kernel module is missing."
+    echo "skipping nft backend tests."
     exit 0
 fi
 
