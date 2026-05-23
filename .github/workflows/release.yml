@@ -18,10 +18,18 @@ jobs:
         target: [x86_64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v4
-      - name: Compile and release
-        uses: rust-build/rust-build.action@v1.4.5
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUSTTARGET: ${{ matrix.target }}
-          EXTRA_FILES: "README.md LICENSE"
-          TOOLCHAIN_VERSION: nightly
+
+      - name: Compile and upload binary
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: cproxy
+          target: ${{ matrix.target }}
+          token: ${{ secrets.GITHUB_TOKEN }}
