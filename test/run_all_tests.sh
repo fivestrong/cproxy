@@ -169,7 +169,14 @@ run_cproxy_cgroup_path_test() {
 
     # Run curl within the specified cgroup
     echo "Running curl within cgroup $CGROUP_PATH..."
-    sudo cgexec -g "*:$CGROUP_NAME" curl -s -I https://www.google.com > /dev/null
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        # cgroup v2
+        sudo bash -c "echo \$\$ > $CGROUP_PATH/cgroup.procs && exec curl -s -I https://www.google.com" > /dev/null
+    else
+        # cgroup v1
+        sudo mkdir -p /sys/fs/cgroup/net_cls/$CGROUP_NAME || true
+        sudo bash -c "echo \$\$ > /sys/fs/cgroup/net_cls/$CGROUP_NAME/tasks && exec curl -s -I https://www.google.com" > /dev/null
+    fi
 
     if [ $? -eq 0 ]; then
         echo "cproxy --cgroup-path test: SUCCESS"
