@@ -116,18 +116,29 @@ sudo cproxy --port 1080 --cgroup-path /sys/fs/cgroup/mygroup --mode tproxy
 
 This command will proxy all TCP and UDP traffic from processes within the `/sys/fs/cgroup/mygroup` cgroup using TPROXY mode on port `1080`.
 
-### WSL + Windows Proxy
+### WSL + Windows Proxy (Built-in TCP Bridge)
 
-When the proxy you actually want to use is a regular HTTP CONNECT or SOCKS5 listener on your Windows host (Clash, V2RayN, mihomo, sing-box, etc.), cproxy can dial it directly without you starting a separate transparent-proxy helper. Pass `--upstream` and cproxy will start an internal TCP bridge on `--port`, accept the redirected connections, recover the original destination via `SO_ORIGINAL_DST`, and re-open it through the upstream proxy.
+When the proxy you want to use is a standard HTTP CONNECT or SOCKS5 listener (e.g. running on your Windows host while cproxy runs inside WSL/containers, like Clash, mihomo, sing-box, etc.), cproxy can forward connections to it directly without requiring you to run a separate transparent-proxy helper. 
 
+By passing `--upstream`, cproxy starts a lightweight, **internal TCP bridge** to bridge the gap between raw diverted TCP traffic and application-layer proxy protocols.
+
+#### How `--port` and `--upstream` work together:
+* **`--port <local_port>`** (Default: `1080`): The **local port** on `127.0.0.1` where `cproxy`'s internal TCP bridge will listen. `cproxy` will configure the firewall to redirect your target program's raw TCP packets to this port.
+* **`--upstream <proxy_url>`**: The address and port of your **external/remote proxy server** (e.g. `socks5://192.168.1.10:1080`). The internal bridge will forward the parsed connections to this address.
+
+> [!WARNING]
+> **Port Conflict Warning:** If your upstream proxy is running on the *same* machine (e.g. `socks5://127.0.0.1:1080`), you **must** change `cproxy`'s local bridge port using `--port` to something else (like `--port 1090`) to avoid a "port already in use" binding conflict!
+
+#### Example usage:
 ```bash
-# Replace 192.168.1.10 with the Windows host IP that the proxy binds to.
+# Redirect raw TCP traffic to local port 1090, where the internal bridge 
+# will wrap it in SOCKS5 protocol and send to the Windows host proxy at 192.168.1.10:1080.
 sudo cproxy \
   --port 1090 \
   --upstream socks5://192.168.1.10:1080 \
   -- curl https://www.google.com
 
-# HTTP CONNECT works the same way.
+# HTTP CONNECT works the same way:
 sudo cproxy --port 1090 --upstream http://192.168.1.10:7890 -- ./your-program
 ```
 
