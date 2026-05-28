@@ -5,9 +5,8 @@ use crate::config::{ChildCommand, Cli, Mode, BRIDGE_MARK};
 use crate::firewall::{select_backend, FirewallBackend};
 use crate::guards::TraceGuard;
 use crate::upstream::UpstreamConfig;
-use eyre::{eyre, Result};
+use eyre::Result;
 use guards::{CGroupGuard, RedirectGuard, TProxyGuard};
-use std::convert::TryFrom;
 use std::os::unix::prelude::CommandExt;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,17 +27,17 @@ fn build_guard(
     backend: Arc<dyn FirewallBackend>,
     mode: Mode,
     args: &Cli,
+    listen_port: u32,
     cgroup_guard: CGroupGuard,
     id_for_chain: u32,
     bridge_mark_exempt: Option<u32>,
 ) -> Result<Box<dyn Drop>> {
-    let port = args.port;
     match mode {
         Mode::Redirect => {
             let output_chain_name = format!("cp_rd_out_{}", id_for_chain);
             Ok(Box::new(RedirectGuard::new(
                 backend,
-                port,
+                listen_port,
                 output_chain_name.as_str(),
                 cgroup_guard,
                 args.redirect_dns,
@@ -51,7 +50,7 @@ fn build_guard(
             let mark = id_for_chain;
             Ok(Box::new(TProxyGuard::new(
                 backend,
-                port,
+                listen_port,
                 mark,
                 output_chain_name.as_str(),
                 prerouting_chain_name.as_str(),
@@ -73,19 +72,23 @@ fn build_guard(
 }
 
 /// Spin up the optional internal bridge (`--upstream`). Returns `None` when no
-/// upstream was requested. The bridge listens on `--port` so existing redirect
-/// rules don't need to know whether they target an external transparent proxy
-/// or the internal bridge.
+/// upstream was requested.
 fn maybe_start_bridge(args: &Cli) -> Result<Option<BridgeGuard>> {
     let url = match &args.upstream {
         Some(u) => u,
         None => return Ok(None),
     };
     let upstream = UpstreamConfig::parse(url)?;
-    let port = u16::try_from(args.port)
-        .map_err(|_| eyre!("--port {} is out of range for u16", args.port))?;
+    let port = args.requested_listen_port()?;
     let guard = BridgeGuard::spawn(port, upstream, BRIDGE_MARK)?;
     Ok(Some(guard))
+}
+
+fn listen_port_for_firewall(args: &Cli, bridge_guard: Option<&BridgeGuard>) -> Result<u32> {
+    match bridge_guard {
+        Some(bridge_guard) => Ok(u32::from(bridge_guard.listen_port())),
+        None => Ok(u32::from(args.requested_listen_port()?)),
+    }
 }
 
 fn redirect_bridge_mark(args: &Cli) -> Option<u32> {
@@ -104,13 +107,13 @@ fn proxy_new_command(args: &Cli) -> Result<ExitStatus> {
         .expect("must have command specified if --pid not provided");
     tracing::info!("subcommand {:?}", child_command);
 
-    let port = args.port;
     let mode = args.mode_enum()?;
 
     // Bridge first so the firewall rules below land on a port that's already
     // listening; otherwise the very first redirected connection could race
     // with bind(2).
-    let _bridge_guard = maybe_start_bridge(args)?;
+    let bridge_guard = maybe_start_bridge(args)?;
+    let listen_port = listen_port_for_firewall(args, bridge_guard.as_ref())?;
 
     let cgroup_guard = CGroupGuard::new(pid)?;
     let backend = select_backend(args.firewall_choice()?, cgroup_guard.hier_v2)?;
@@ -118,6 +121,7 @@ fn proxy_new_command(args: &Cli) -> Result<ExitStatus> {
         backend,
         mode,
         args,
+        listen_port,
         cgroup_guard,
         pid,
         redirect_bridge_mark(args),
@@ -136,7 +140,7 @@ fn proxy_new_command(args: &Cli) -> Result<ExitStatus> {
     if let Some(sudo_gid) = sudo_gid {
         command.gid(sudo_gid.parse().expect("invalid gid"));
     }
-    command.env("CPROXY_ENV", format!("cproxy/{}", port));
+    command.env("CPROXY_ENV", format!("cproxy/{}", listen_port));
     if let Some(sudo_home) = sudo_home {
         command.env("HOME", sudo_home);
     }
@@ -171,7 +175,8 @@ fn proxy_new_command(args: &Cli) -> Result<ExitStatus> {
 fn proxy_existing_pid(pid: u32, args: &Cli) -> Result<()> {
     let mode = args.mode_enum()?;
 
-    let _bridge_guard = maybe_start_bridge(args)?;
+    let bridge_guard = maybe_start_bridge(args)?;
+    let listen_port = listen_port_for_firewall(args, bridge_guard.as_ref())?;
 
     let cgroup_guard = CGroupGuard::new(pid)?;
     let backend = select_backend(args.firewall_choice()?, cgroup_guard.hier_v2)?;
@@ -179,6 +184,7 @@ fn proxy_existing_pid(pid: u32, args: &Cli) -> Result<()> {
         backend,
         mode,
         args,
+        listen_port,
         cgroup_guard,
         pid,
         redirect_bridge_mark(args),
@@ -202,7 +208,8 @@ fn proxy_existing_pid(pid: u32, args: &Cli) -> Result<()> {
 fn proxy_cgroup_paths(paths: Vec<String>, args: &Cli) -> Result<()> {
     let mode = args.mode_enum()?;
 
-    let _bridge_guard = maybe_start_bridge(args)?;
+    let bridge_guard = maybe_start_bridge(args)?;
+    let listen_port = listen_port_for_firewall(args, bridge_guard.as_ref())?;
 
     let mut guards: Vec<Box<dyn Drop>> = Vec::new();
     let mut shared_backend: Option<Arc<dyn FirewallBackend>> = None;
@@ -221,6 +228,7 @@ fn proxy_cgroup_paths(paths: Vec<String>, args: &Cli) -> Result<()> {
             backend,
             mode,
             args,
+            listen_port,
             cgroup_guard,
             id_for_chain,
             redirect_bridge_mark(args),

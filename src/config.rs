@@ -1,4 +1,5 @@
 use eyre::{eyre, Result};
+use std::convert::TryFrom;
 use structopt::StructOpt;
 
 /// Reserved fwmark for cproxy's own outbound sockets (the bridge in `--upstream`
@@ -6,6 +7,8 @@ use structopt::StructOpt;
 /// connection to the remote HTTP/SOCKS proxy does not get redirected back into
 /// itself.
 pub const BRIDGE_MARK: u32 = 0xC9B3;
+pub const DEFAULT_PROXY_PORT: u16 = 1080;
+pub const AUTO_BRIDGE_PORT: u16 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -56,8 +59,8 @@ pub struct Cli {
     /// is the local port that the built-in bridge listens on (still on
     /// 127.0.0.1); otherwise it is the address of an external transparent
     /// proxy that you started yourself.
-    #[structopt(long, env = "CPROXY_PORT", default_value = "1080")]
-    pub port: u32,
+    #[structopt(long, env = "CPROXY_PORT")]
+    pub port: Option<u32>,
 
     /// redirect DNS traffic. This option only works with redirect mode
     #[structopt(long)]
@@ -113,11 +116,21 @@ impl Cli {
         FirewallChoice::parse(&self.firewall)
     }
 
+    pub fn requested_listen_port(&self) -> Result<u16> {
+        let port = match self.port {
+            Some(port) => port,
+            None if self.upstream.is_some() => AUTO_BRIDGE_PORT as u32,
+            None => DEFAULT_PROXY_PORT as u32,
+        };
+        u16::try_from(port).map_err(|_| eyre!("--port {} is out of range for u16", port))
+    }
+
     /// Validate combinations that we explicitly do not support to fail fast
     /// instead of producing weird runtime behaviour.
     pub fn validate(&self) -> Result<()> {
         let mode = self.mode_enum()?;
         let _ = self.firewall_choice()?;
+        let _ = self.requested_listen_port()?;
 
         if self.upstream.is_some() && mode != Mode::Redirect {
             return Err(eyre!(
@@ -135,5 +148,52 @@ impl Cli {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(port: Option<u32>, upstream: Option<&str>) -> Cli {
+        Cli {
+            port,
+            redirect_dns: false,
+            mode: "redirect".to_owned(),
+            override_dns: None,
+            pid: None,
+            cgroup_path: Vec::new(),
+            upstream: upstream.map(str::to_owned),
+            firewall: "auto".to_owned(),
+            command: None,
+        }
+    }
+
+    #[test]
+    fn upstream_without_port_requests_auto_port() {
+        assert_eq!(
+            cli(None, Some("socks5://127.0.0.1:1080"))
+                .requested_listen_port()
+                .unwrap(),
+            AUTO_BRIDGE_PORT
+        );
+    }
+
+    #[test]
+    fn upstream_with_port_uses_explicit_port() {
+        assert_eq!(
+            cli(Some(1090), Some("socks5://127.0.0.1:1080"))
+                .requested_listen_port()
+                .unwrap(),
+            1090
+        );
+    }
+
+    #[test]
+    fn no_upstream_without_port_uses_default_proxy_port() {
+        assert_eq!(
+            cli(None, None).requested_listen_port().unwrap(),
+            DEFAULT_PROXY_PORT
+        );
     }
 }

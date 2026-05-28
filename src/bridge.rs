@@ -360,6 +360,7 @@ async fn accept_loop(
 /// RAII guard that owns the tokio runtime hosting the bridge. Dropping it
 /// signals shutdown and joins the worker thread.
 pub struct BridgeGuard {
+    listen_port: u16,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -376,7 +377,7 @@ impl BridgeGuard {
         probe_so_mark_capability(bridge_mark)?;
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u16>>();
 
         let handle = std::thread::Builder::new()
             .name("cproxy-bridge".into())
@@ -404,7 +405,18 @@ impl BridgeGuard {
                             return;
                         }
                     };
-                    if ready_tx.send(Ok(())).is_err() {
+                    let actual_port = match listener.local_addr() {
+                        Ok(addr) => addr.port(),
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(eyre!(
+                                "bridge failed to read local address for 127.0.0.1:{}: {}",
+                                listen_port,
+                                e
+                            )));
+                            return;
+                        }
+                    };
+                    if ready_tx.send(Ok(actual_port)).is_err() {
                         return;
                     }
                     accept_loop(listener, Arc::new(upstream), bridge_mark, shutdown_rx).await;
@@ -413,13 +425,14 @@ impl BridgeGuard {
             .map_err(|e| eyre!("failed to spawn bridge thread: {}", e))?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => {
+            Ok(Ok(actual_port)) => {
                 tracing::info!(
                     "bridge listening on 127.0.0.1:{} (mark=0x{:x})",
-                    listen_port,
+                    actual_port,
                     bridge_mark
                 );
                 Ok(Self {
+                    listen_port: actual_port,
                     shutdown: Some(shutdown_tx),
                     handle: Some(handle),
                 })
@@ -427,6 +440,10 @@ impl BridgeGuard {
             Ok(Err(e)) => Err(e),
             Err(_) => Err(eyre!("bridge thread terminated before reporting readiness")),
         }
+    }
+
+    pub fn listen_port(&self) -> u16 {
+        self.listen_port
     }
 }
 

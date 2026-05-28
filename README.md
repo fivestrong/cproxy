@@ -123,22 +123,21 @@ When the proxy you want to use is a standard HTTP CONNECT or SOCKS5 listener (e.
 By passing `--upstream`, cproxy starts a lightweight, **internal TCP bridge** to bridge the gap between raw diverted TCP traffic and application-layer proxy protocols.
 
 #### How `--port` and `--upstream` work together:
-* **`--port <local_port>`** (Default: `1080`): The **local port** on `127.0.0.1` where `cproxy`'s internal TCP bridge will listen. `cproxy` will configure the firewall to redirect your target program's raw TCP packets to this port.
+* **`--port <local_port>`**: The **local port** on `127.0.0.1` where `cproxy`'s internal TCP bridge will listen. When omitted in `--upstream` mode, cproxy asks the OS for an available port and configures the firewall to redirect your target program's raw TCP packets to that chosen port.
 * **`--upstream <proxy_url>`**: The address and port of your **external/remote proxy server** (e.g. `socks5://192.168.1.10:1080`). The internal bridge will forward the parsed connections to this address.
 
-> [!WARNING]
-> **Port Conflict Warning:** If your upstream proxy is running on the *same* machine (e.g. `socks5://127.0.0.1:1080`), you **must** change `cproxy`'s local bridge port using `--port` to something else (like `--port 1090`) to avoid a "port already in use" binding conflict!
+> [!NOTE]
+> In non-`--upstream` modes, omitted `--port` still defaults to `1080` because it points at an external transparent proxy that cproxy does not own. In `--upstream` mode, only an explicitly supplied `--port` can conflict.
 
 #### Example usage:
 ```bash
-# Redirect raw TCP traffic to local port 1090, where the internal bridge 
-# will wrap it in SOCKS5 protocol and send to the Windows host proxy at 192.168.1.10:1080.
+# cproxy picks a free local bridge port automatically, wraps redirected
+# TCP traffic in SOCKS5, and sends it to the Windows host proxy.
 sudo cproxy \
-  --port 1090 \
   --upstream socks5://192.168.1.10:1080 \
   -- curl https://www.google.com
 
-# HTTP CONNECT works the same way:
+# Pin the local bridge port only when another tool needs to know it:
 sudo cproxy --port 1090 --upstream http://192.168.1.10:7890 -- ./your-program
 ```
 

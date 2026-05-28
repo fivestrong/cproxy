@@ -6,8 +6,8 @@
 #   * cproxy --upstream http://127.0.0.1:1083  -> xray http inbound 1083
 #   * cproxy --upstream socks5://127.0.0.1:1084 -> xray socks inbound 1084
 #
-# We rely on `cproxy --port 1090` being a local listener that the bridge owns
-# itself. Each redirect rule sends the cgroup's TCP traffic to 1090 and the
+# In upstream mode, cproxy picks a free local bridge port automatically. Each
+# redirect rule sends the cgroup's TCP traffic to the selected port and the
 # bridge re-opens the connection via the chosen upstream proxy.
 
 set -euo pipefail
@@ -73,7 +73,6 @@ run_cproxy_upstream() {
     local upstream=$2
     echo "=== cproxy upstream: $label ($upstream) ==="
     sudo env RUST_LOG=debug cproxy \
-        --port 1090 \
         --upstream "$upstream" \
         -- curl -s -I --max-time 15 https://www.google.com > /dev/null
 }

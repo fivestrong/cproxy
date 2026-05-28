@@ -120,22 +120,21 @@ sudo cproxy --port 1080 --cgroup-path /sys/fs/cgroup/mygroup --mode tproxy
 通过传入 `--upstream` 参数，`cproxy` 会在本地启动一个轻量级的**内置 TCP 桥接器**，自动接收被重定向过来的 TCP 流量，使用 `SO_ORIGINAL_DST`（以及 TLS SNI/HTTP Host 嗅探）解析出真实的目的地址，并通过 SOCKS5/HTTP CONNECT 握手协议转发给上游代理。
 
 #### `--port` 与 `--upstream` 是如何协同工作的：
-* **`--port <local_port>`** (默认值: `1080`)：`cproxy` **内置 TCP 桥接器在本地 `127.0.0.1` 监听的端口**。`cproxy` 会自动配置防火墙规则，将目标进程的所有原始 TCP 数据包重定向到该端口。
+* **`--port <local_port>`**：`cproxy` **内置 TCP 桥接器在本地 `127.0.0.1` 监听的端口**。在 `--upstream` 模式下省略该参数时，cproxy 会向系统申请一个可用端口，并自动配置防火墙规则，将目标进程的所有原始 TCP 数据包重定向到这个实际端口。
 * **`--upstream <proxy_url>`**：你的**外部/远程代理服务地址**（例如 `socks5://192.168.1.10:1080`）。内置桥接器接收到被劫持的连接后，会在此进行协议封装并转发给这个上游代理地址。
 
-> [!WARNING]
-> **端口冲突警告**：如果你的上游代理服务也运行在当前这台机器的 `127.0.0.1:1080`，你**必须**使用 `--port` 将 `cproxy` 的本地桥接端口修改为其他端口（如 `--port 1090`），否则会因为在同一个本地 IP 绑定相同的端口而导致“端口已被占用”冲突！
+> [!NOTE]
+> 非 `--upstream` 模式下，省略 `--port` 仍然默认使用 `1080`，因为此时它指向的是 cproxy 外部的透明代理端口。`--upstream` 模式下只有显式指定 `--port` 时才可能发生端口冲突。
 
 #### 示例命令：
 ```bash
-# 拦截原始 TCP 流量并重定向到本地 1090 端口的内置桥接器，
-# 桥接器会自动进行 SOCKS5 握手并转发给运行在 Windows 宿主机 192.168.1.10:1080 的代理端口。
+# cproxy 自动选择可用的本地桥接端口，拦截原始 TCP 流量后进行
+# SOCKS5 握手，并转发给运行在 Windows 宿主机上的代理端口。
 sudo cproxy \
-  --port 1090 \
   --upstream socks5://192.168.1.10:1080 \
   -- curl https://www.google.com
 
-# 对接普通的 HTTP 代理同样简单：
+# 只有在其他工具需要感知本地桥接端口时，才需要显式固定端口：
 sudo cproxy --port 1090 --upstream http://192.168.1.10:7890 -- ./your-program
 ```
 
