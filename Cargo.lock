@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "cproxy"
-version = "4.2.3"
+version = "4.2.4"
 dependencies = [
  "cgroups-rs",
  "cmd_lib",
