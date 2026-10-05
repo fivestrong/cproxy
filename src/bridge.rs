@@ -94,10 +94,10 @@ fn get_original_dst_v4(fd: i32) -> Result<SocketAddrV4> {
 async fn dial_upstream(upstream: &UpstreamConfig, mark: u32) -> Result<TcpStream> {
     let endpoint = upstream.endpoint();
     let mut last_err: Option<eyre::Report> = None;
-    let mut resolved = tokio::net::lookup_host(&endpoint)
+    let resolved = tokio::net::lookup_host(&endpoint)
         .await
         .map_err(|e| eyre!("failed to resolve upstream '{}': {}", endpoint, e))?;
-    while let Some(addr) = resolved.next() {
+    for addr in resolved {
         match dial_one(addr, mark).await {
             Ok(stream) => return Ok(stream),
             Err(e) => {

@@ -81,7 +81,8 @@ fn nft_apply(program: &str) -> Result<()> {
 
 /// Translate a cproxy cgroup path (either relative like `cproxy-1234` or
 /// absolute like `/sys/fs/cgroup/foo/bar`) into the (level, name) tuple that
-/// `nft socket cgroupv2 level N "name"` expects.
+/// `nft socket cgroupv2 level N "name"` expects. The name must retain the
+/// full path relative to /sys/fs/cgroup, not just the leaf component.
 fn cgroupv2_level_name(cg: &CgroupMatch) -> Result<(u32, String)> {
     let path = cg
         .v2_path
@@ -95,10 +96,7 @@ fn cgroupv2_level_name(cg: &CgroupMatch) -> Result<(u32, String)> {
         return Err(eyre!("cgroup path '{}' resolves to an empty name", path));
     }
     let level = parts.len() as u32;
-    let name = parts
-        .last()
-        .map(|s| (*s).to_string())
-        .ok_or_else(|| eyre!("cgroup path '{}' has no leaf component", path))?;
+    let name = parts.join("/");
     Ok((level, name))
 }
 
@@ -277,7 +275,18 @@ mod tests {
         };
         let (level, name) = cgroupv2_level_name(&cg).unwrap();
         assert_eq!(level, 3);
-        assert_eq!(name, "c");
+        assert_eq!(name, "a/b/c");
+    }
+
+    #[test]
+    fn cgroupv2_level_name_handles_nested_relative_path() {
+        let cg = CgroupMatch {
+            class_id: 1234,
+            v2_path: Some("user.slice/session.scope/cproxy-1234".into()),
+        };
+        let (level, name) = cgroupv2_level_name(&cg).unwrap();
+        assert_eq!(level, 3);
+        assert_eq!(name, "user.slice/session.scope/cproxy-1234");
     }
 
     #[test]

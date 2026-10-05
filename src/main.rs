@@ -263,7 +263,7 @@ fn main() -> Result<()> {
     let args: Cli = Cli::from_args();
     args.validate()?;
 
-    if args.cgroup_path.len() > 0 {
+    if !args.cgroup_path.is_empty() {
         proxy_cgroup_paths(args.cgroup_path.clone(), &args)?;
     } else {
         match args.pid {
