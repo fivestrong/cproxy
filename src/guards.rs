@@ -73,9 +73,13 @@ impl CGroupGuard {
             // v2 packet matching needs only membership, not resource controllers.
             std::fs::create_dir_all(hier.root().join(path))?;
             let cg = Cgroup::load(hier, path);
-            let parent_type = cg.parent_control_group().get_cgroup_type()?;
-            if parent_type == "domain threaded" || parent_type == "threaded" {
-                cg.set_cgroup_type("threaded")?;
+            let parent = cg.parent_control_group();
+            // The hierarchy root has no cgroup.type and can host domain children.
+            if !parent.path().is_empty() {
+                let parent_type = parent.get_cgroup_type()?;
+                if parent_type == "domain threaded" || parent_type == "threaded" {
+                    cg.set_cgroup_type("threaded")?;
+                }
             }
             Ok(cg)
         } else {
@@ -322,6 +326,118 @@ impl Drop for TraceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cgroups_rs::fs::{cpu::CpuController, Subsystem};
+    use std::path::{Path, PathBuf};
+
+    #[derive(Debug)]
+    struct TestRoot {
+        path: PathBuf,
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.path).expect("remove test cgroup directory");
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestHierarchy {
+        root: Arc<TestRoot>,
+    }
+
+    impl TestHierarchy {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "cproxy-cgroup-test-{}-{}",
+                std::process::id(),
+                nonce
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self {
+                root: Arc::new(TestRoot { path }),
+            }
+        }
+    }
+
+    impl Hierarchy for TestHierarchy {
+        fn v2(&self) -> bool {
+            true
+        }
+
+        fn root(&self) -> PathBuf {
+            self.root.path.clone()
+        }
+
+        fn subsystems(&self) -> Vec<Subsystem> {
+            vec![Subsystem::Cpu(CpuController::new(
+                self.root(),
+                PathBuf::new(),
+                true,
+            ))]
+        }
+
+        fn root_control_group(&self) -> Cgroup {
+            Cgroup::load(Box::new(self.clone()), "")
+        }
+
+        fn parent_control_group(&self, path: &str) -> Cgroup {
+            Cgroup::load(Box::new(self.clone()), Path::new(path).parent().unwrap())
+        }
+    }
+
+    #[test]
+    fn creates_cgroup_under_root_without_cgroup_type() {
+        let hier = TestHierarchy::new();
+        assert!(!hier.root().join("cgroup.type").exists());
+        let cg = CGroupGuard::create_cgroup(Box::new(hier.clone()), "proxy", 1).unwrap();
+        assert_eq!(cg.path(), "proxy");
+        assert!(hier.root().join("proxy").is_dir());
+        assert!(!hier.root().join("proxy/cgroup.type").exists());
+    }
+
+    #[test]
+    fn preserves_nested_parent_type_handling() {
+        for parent_type in ["domain", "threaded", "domain threaded"] {
+            let hier = TestHierarchy::new();
+            let parent = hier.root().join("parent");
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::write(parent.join("cgroup.type"), format!("{}\n", parent_type)).unwrap();
+            let _cg =
+                CGroupGuard::create_cgroup(Box::new(hier.clone()), "parent/proxy", 1).unwrap();
+            let child_type = parent.join("proxy/cgroup.type");
+            if parent_type == "domain" {
+                assert!(!child_type.exists());
+            } else {
+                assert_eq!(std::fs::read_to_string(child_type).unwrap(), "threaded");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_non_root_parent_type_returns_error() {
+        let hier = TestHierarchy::new();
+        let expected_path = hier.root().join("parent/cgroup.type");
+        let error = CGroupGuard::create_cgroup(Box::new(hier), "parent/proxy", 1).unwrap_err();
+        assert!(error.to_string().contains(expected_path.to_str().unwrap()));
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .map_or(false, |error| error.kind() == std::io::ErrorKind::NotFound)
+        }));
+    }
+
+    #[test]
+    fn threaded_type_write_failure_returns_error() {
+        let hier = TestHierarchy::new();
+        let parent = hier.root().join("parent");
+        std::fs::create_dir_all(parent.join("proxy/cgroup.type")).unwrap();
+        std::fs::write(parent.join("cgroup.type"), "threaded\n").unwrap();
+        assert!(CGroupGuard::create_cgroup(Box::new(hier), "parent/proxy", 1).is_err());
+    }
 
     #[test]
     fn missing_pid_returns_error() {
